@@ -1,0 +1,3 @@
+# Genera el archivo real 'passwd' (ignorado en Git) ejecutando en tu terminal:
+# mosquitto_passwd -c broker/mosquitto/passwd esp32_nodo
+# mosquitto_passwd -b broker/mosquitto/passwd nodered_srv TU_PASSWORD_SEGURO
