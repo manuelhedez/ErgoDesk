@@ -1,0 +1,317 @@
+[
+    {
+        "id": "tab_ergodesk_01",
+        "type": "tab",
+        "label": "ErgoDesk IoT - Middleware",
+        "disabled": false,
+        "info": "Capa 3 (Middleware): Validación JSON, estimación de lux (NOM-025-STPS), cálculo del Índice de Riesgo Ergonómico (IRE) y ajuste adaptativo de pausas hacia el ESP32."
+    },
+    {
+        "id": "cfg_mosquitto_local",
+        "type": "mqtt-broker",
+        "name": "Mosquitto Local (Laboratorio)",
+        "broker": "127.0.0.1",
+        "port": "1883",
+        "clientid": "nodered_srv_ergodesk",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "autoUnsubscribe": true
+    },
+    {
+        "id": "node_in_telemetry",
+        "type": "mqtt in",
+        "z": "tab_ergodesk_01",
+        "name": "Telemetría ESP32",
+        "topic": "ergodesk/telemetria",
+        "qos": "1",
+        "datatype": "utf8",
+        "broker": "cfg_mosquitto_local",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 140,
+        "y": 140,
+        "wires": [
+            [
+                "node_json_telemetry"
+            ]
+        ]
+    },
+    {
+        "id": "node_json_telemetry",
+        "type": "json",
+        "z": "tab_ergodesk_01",
+        "name": "Parsear JSON",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 340,
+        "y": 140,
+        "wires": [
+            [
+                "node_fn_ire"
+            ]
+        ]
+    },
+    {
+        "id": "node_fn_ire",
+        "type": "function",
+        "z": "tab_ergodesk_01",
+        "name": "Validar Esquema + Lux + Cálculo IRE",
+        "func": "const d = msg.payload;\n\n// 1. Sanitización y validación de esquema JSON (OWASP I3)\nif (!d || typeof d.angulo_deg !== 'number' || typeof d.luz_pct !== 'number' || typeof d.estado !== 'string') {\n    node.warn('Payload malformado descartado en ergodesk/telemetria');\n    return null;\n}\n\n// 2. Acumuladores históricos de sesión en contexto de flujo\nlet stats = flow.get('sessionStats') || {\n    total: 0,\n    badPosture: 0,\n    lowLight: 0,\n    startMs: Date.now()\n};\n\nstats.total += 1;\nif (d.estado === 'MALA_POSTURA' || d.estado === 'PAUSA_ACTIVA') stats.badPosture += 1;\nif (d.estado === 'POCA_LUZ') stats.lowLight += 1;\nflow.set('sessionStats', stats);\n\n// 3. Curva de calibración LDR (%) -> Lux estimados (Ref. NOM-025-STPS: 300 lx)\nconst luxEstimado = Math.round((d.luz_pct / 100.0) * 600);\n\n// 4. Cálculo del Índice de Riesgo Ergonómico (IRE: 0 a 100)\nconst umbralAng = d.umbral_ang || 18.0;\nconst ratioAngulo = Math.min(d.angulo_deg / umbralAng, 1.5);\nconst scoreAngulo = Math.min(ratioAngulo * 28, 40); // Máx 40 pts\n\nconst pctMalaPostura = (stats.badPosture / stats.total) * 100;\nconst scoreHistorico = (pctMalaPostura / 100) * 35;  // Máx 35 pts\n\nconst deficitLuz = Math.max(0, (300 - luxEstimado) / 300);\nconst scoreLuz = deficitLuz * 25;                    // Máx 25 pts\n\nconst ire = Math.round(Math.min(100, scoreAngulo + scoreHistorico + scoreLuz));\n\n// Etiqueta textual explícita para cumplimiento WCAG 2.1 (1.4.1 Uso del color)\nlet nivelRiesgo = 'RIESGO_BAJO';\nif (ire >= 65) nivelRiesgo = 'RIESGO_ALTO';\nelse if (ire >= 35) nivelRiesgo = 'RIESGO_MODERADO';\n\nconst minutosSesion = Math.round((Date.now() - stats.startMs) / 60000);\n\nmsg.payload = {\n    uptime_s: d.uptime_s,\n    angulo_deg: d.angulo_deg,\n    umbral_ang: umbralAng,\n    luz_pct: d.luz_pct,\n    lux_estimado: luxEstimado,\n    cumple_nom025: luxEstimado >= 300,\n    estado: d.estado,\n    buffered: Boolean(d.buffered),\n    ire: ire,\n    nivel_riesgo: nivelRiesgo,\n    pct_mala_postura: Number(pctMalaPostura.toFixed(1)),\n    minutos_sesion: minutosSesion\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 600,
+        "y": 140,
+        "wires": [
+            [
+                "node_dbg_telemetry",
+                "node_fn_adaptive",
+                "node_http_cloud"
+            ]
+        ]
+    },
+    {
+        "id": "node_fn_adaptive",
+        "type": "function",
+        "z": "tab_ergodesk_01",
+        "name": "Ajuste Adaptativo Pausas (Cloud -> Edge)",
+        "func": "const d = msg.payload;\nconst now = Date.now();\nconst lastAdjust = flow.get('lastAdaptiveAdjustMs') || 0;\n\n// Si hay deterioro postural sostenido tras 45 min o IRE crítico (>= 70),\n// envía consigna al ESP32 para reducir el intervalo de pausas activas a 30 min.\nconst deterioroProlongado = (d.minutos_sesion >= 45 && d.ire >= 55);\nconst riesgoCritico = (d.ire >= 70 && d.uptime_s >= 30);\n\nif ((deterioroProlongado || riesgoCritico) && (now - lastAdjust > 600000)) {\n    flow.set('lastAdaptiveAdjustMs', now);\n    return {\n        payload: 'PAUSE_MIN:30'\n    };\n}\n\nreturn null;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 920,
+        "y": 200,
+        "wires": [
+            [
+                "node_out_config",
+                "node_dbg_config"
+            ]
+        ]
+    },
+    {
+        "id": "node_in_alerts",
+        "type": "mqtt in",
+        "z": "tab_ergodesk_01",
+        "name": "Alertas ESP32",
+        "topic": "ergodesk/alertas",
+        "qos": "1",
+        "datatype": "utf8",
+        "broker": "cfg_mosquitto_local",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 130,
+        "y": 260,
+        "wires": [
+            [
+                "node_json_alerts"
+            ]
+        ]
+    },
+    {
+        "id": "node_json_alerts",
+        "type": "json",
+        "z": "tab_ergodesk_01",
+        "name": "Parsear Alerta",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 340,
+        "y": 260,
+        "wires": [
+            [
+                "node_dbg_alerts"
+            ]
+        ]
+    },
+    {
+        "id": "node_out_config",
+        "type": "mqtt out",
+        "z": "tab_ergodesk_01",
+        "name": "Consignas ESP32 (ergodesk/config)",
+        "topic": "ergodesk/config",
+        "qos": "1",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "cfg_mosquitto_local",
+        "x": 1240,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "node_inj_calibrate",
+        "type": "inject",
+        "z": "tab_ergodesk_01",
+        "name": "Demo: Calibrar Postura 0°",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "CALIBRATE",
+        "payloadType": "str",
+        "x": 890,
+        "y": 280,
+        "wires": [
+            [
+                "node_out_config",
+                "node_dbg_config"
+            ]
+        ]
+    },
+    {
+        "id": "node_inj_pause30",
+        "type": "inject",
+        "z": "tab_ergodesk_01",
+        "name": "Demo: Pausa Activa 30 min",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "PAUSE_MIN:30",
+        "payloadType": "str",
+        "x": 890,
+        "y": 330,
+        "wires": [
+            [
+                "node_out_config",
+                "node_dbg_config"
+            ]
+        ]
+    },
+    {
+        "id": "node_inj_angle15",
+        "type": "inject",
+        "z": "tab_ergodesk_01",
+        "name": "Demo: Umbral Ángulo 15°",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "MAX_ANGLE:15.0",
+        "payloadType": "str",
+        "x": 890,
+        "y": 380,
+        "wires": [
+            [
+                "node_out_config",
+                "node_dbg_config"
+            ]
+        ]
+    },
+    {
+        "id": "node_http_cloud",
+        "type": "http request",
+        "z": "tab_ergodesk_01",
+        "d": true,
+        "name": "ThingsBoard Cloud (Activar con Token)",
+        "method": "POST",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "https://thingsboard.cloud/api/v1/REEMPLAZAR_CON_TOKEN_EN_LOCAL/telemetry",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [
+            {
+                "keyType": "Content-Type",
+                "keyValue": "",
+                "valueType": "application/json",
+                "valueValue": ""
+            }
+        ],
+        "x": 930,
+        "y": 80,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "node_dbg_telemetry",
+        "type": "debug",
+        "z": "tab_ergodesk_01",
+        "name": "Telemetría + IRE",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "payload.ire",
+        "statusType": "auto",
+        "x": 890,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "node_dbg_alerts",
+        "type": "debug",
+        "z": "tab_ergodesk_01",
+        "name": "Alertas de Cambio de Estado",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 600,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "node_dbg_config",
+        "type": "debug",
+        "z": "tab_ergodesk_01",
+        "name": "Consignas enviadas (ergodesk/config)",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1240,
+        "y": 340,
+        "wires": []
+    }
+]
