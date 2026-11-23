@@ -1,0 +1,18 @@
+New-Item -ItemType File -Force -Path `
+  ".gitignore", "README.md", `
+  "firmware/platformio.ini", `
+  "firmware/include/pins_and_uuids.h", "firmware/include/app_types.h", `
+  "firmware/include/certs.example.h", "firmware/include/secrets.example.h", `
+  "firmware/include/sensors.h", "firmware/include/actuators.h", `
+  "firmware/include/nvs_storage.h", "firmware/include/ble_provisioning.h", `
+  "firmware/include/ring_buffer.h", "firmware/include/mqtt_mosquitto.h", `
+  "firmware/src/main.cpp", "firmware/src/sensors.cpp", `
+  "firmware/src/actuators.cpp", "firmware/src/nvs_storage.cpp", `
+  "firmware/src/ble_provisioning.cpp", "firmware/src/ring_buffer.cpp", `
+  "firmware/src/mqtt_mosquitto.cpp", `
+  "broker/mosquitto/mosquitto.conf", "broker/mosquitto/acl.conf", `
+  "broker/mosquitto/passwd.example", "broker/mosquitto/certs/.gitkeep", `
+  "broker/node-red/flows.json", `
+  "hardware/pinout_y_bom.md", `
+  "docs/perfil_gatt_ble.md", "docs/seguridad_owasp_iot.md", `
+  "docs/accesibilidad_wcag_en301.md", "docs/pruebas_estres.md"
